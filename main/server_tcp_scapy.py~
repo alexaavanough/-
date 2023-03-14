@@ -1,0 +1,181 @@
+from scapy.all import sr1, Raw, send, L3RawSocket, MTU
+from scapy.layers.inet import IP, TCP
+from random import randint
+import sys
+from argparse import ArgumentParser
+from threading import Thread
+
+
+class ClientTCP:
+    def __init__(self, server_ip: str, server_port: int):
+        self.ip = IP(dst=server_ip)
+
+        self.seq = randint(0, 2 ** 16 - 1)
+        self.ack = 0
+
+        self.connected = False
+        self.listen_thread = None
+
+        self.sport = server_port
+        self.dport = None
+
+        self.time_retry = 3
+        self.count = 5
+
+    def _ack(self, p):
+        self.ack = p[TCP].seq + len(p[Raw])
+        packet_ack = self.ip / TCP(sport=self.sport, dport=self.dport, flags="A", seq=self.seq, ack=self.ack)
+        send(packet_ack)
+
+    def get_connection(self, p):
+        self.dport = p[TCP].sport
+
+        packet_syn_ack = self.ip / TCP(sport=self.sport, dport=self.dport, flags='S', seq=self.seq)
+        packet_ack = None
+        attempt = 0
+
+        while attempt < self.count:
+            packet_ack = sr1(packet_syn_ack, timeout=self.time_retry)
+
+        self.seq += 1
+
+        if packet_syn_ack is None:
+            print(f'No answer from {self.ip}:{self.dport}')
+            sys.exit(1)
+        elif not packet_syn_ack.haslayer(TCP):
+            print(f'TCP error: no layer TCP')
+            sys.exit(1)
+        elif packet_syn_ack[TCP].flags & 0x12 != 0x12:
+            print(f'TCP error: no SYN/ACK flags')
+            sys.exit(1)
+        elif packet_syn_ack[TCP].ack != self.seq:
+            print("ACK err")
+            sys.exit(1)
+
+        self.ack = packet_syn_ack[TCP].seq + 1
+        packet_ack = self.ip / TCP(sport=self.sport, dport=self.dport, flags='A', seq=self.seq, ack=self.ack)
+        send(packet_ack)
+
+        self.connected = True
+        print('Connected')
+
+        self.listen_thread = Thread(target=self.receive)
+        self.listen_thread.start()
+
+    def receive(self):
+        socket = L3RawSocket()
+        while self.connected:
+            p = socket.recv(MTU)
+
+            if p.haslayer(TCP) and p[TCP].dport == self.sport:
+                if p[TCP].flags & 0x18 == 0x18:
+                    print(f"From client {p[IP].src}:{p[TCP].port} >>> {p[TCP].data}")
+                    self._ack(p)
+
+                if p[TCP].flags & 0x04 == 0x04:
+                    print("Disconnect with err")
+                    self.close_rst(p)
+
+                if p[TCP].flags & 0x01 == 0x01:
+                    print(f"{p[IP].src}:{p[TCP].port} disconnected")
+                    self.close(p)
+
+                if p[TCP].flags & 0x02 == 0x02:
+                    print(f"{p[IP].src}:{p[TCP].port} connected")
+                    self.get_connection(p)
+
+        socket.close()
+        self.listen_thread = None
+
+    def close(self, p):
+        self.connected = False
+        self.seq += 1
+        packet_fyn_ack = self.ip / TCP(sport=self.sport, dport=self.dport, flags='FA', seq=self.seq, ack=self.ack)
+        packet_fyn = None
+        attempt = 0
+
+        while attempt < self.count:
+            packet_fyn = sr1(packet_fyn_ack, timeout=self.time_retry)
+
+        if packet_fyn is None:
+            print(f'No answer from {self.ip}:{self.dport}')
+            return
+        elif not packet_fyn.haslayer(TCP):
+            print(f'TCP error: no layer TCP')
+            return
+        elif packet_fyn[TCP].flags & 0x11 != 0x11:
+            print(f'No FIN|ACK flag')
+            return
+        elif packet_fyn[TCP].ack != self.seq:
+            print("ACK err")
+            return
+
+        self.ack = packet_fyn[TCP].seq + 1
+        packet_ack = self.ip / TCP(sport=self.sport, dport=self.dport, flags='A', seq=self.seq, ack=self.ack)
+        send(packet_ack)
+
+        print('DISCONNECTED')
+
+    def close_rst(self, p):
+        self.connected = False
+        self.ack = p[TCP].seq + 1
+        packet_rst = self.ip / TCP(sport=self.sport, dport=self.dport, flags='R', seq=self.seq, ack=self.ack)
+        send(packet_rst)
+
+        print('DISCONNECTED WITH ERROR')
+
+    def send(self, msg):
+        packet_push = self.ip / TCP(sport=self.sport, dport=self.dport, flags='PA', seq=self.seq, ack=self.ack)
+        self.seq += len(packet_push[Raw])
+
+        packet_ack = None
+        attempt = 0
+
+        while attempt < self.count:
+            packet_ack = sr1(packet_push, timeout=self.time_retry)
+
+        if packet_ack is None:
+            print(f'No answer from {self.ip}:{self.dport}')
+            sys.exit(1)
+        elif not packet_ack.haslayer(TCP):
+            print(f'TCP error: no layer TCP')
+            sys.exit(1)
+        elif packet_ack[TCP].flags & 0x10 != 0x10:
+            print(f'No FIN|ACK flag')
+            sys.exit(1)
+        elif packet_ack[TCP].ack != self.seq:
+            print("ACK err")
+            sys.exit(1)
+
+
+def parse():
+    parser = ArgumentParser()
+    parser.add_argument(
+        '-ip',
+        type=str,
+        help="server IP"
+    )
+    parser.add_argument(
+        '-sp', '--server_port',
+        type=int,
+        help="server port"
+    )
+    parser.add_argument(
+        '-hp', '--host_port',
+        type=int,
+        help="host port"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse()
+    client = ClientTCP(args.ip, args.server_port, args.host_port)
+    msg = str()
+
+    while msg != 'disconnect':
+        msg = input("> ")
+        client.send(msg)
+
+    client.close()
